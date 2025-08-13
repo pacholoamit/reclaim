@@ -1,6 +1,7 @@
 import { BaseCommand, type CommandContext } from './base-command.js';
-import { scanForCacheFolders, formatSize } from '../libs/cache-scanner.js';
-import { deleteFolder, parseSizeToBytes } from '../libs/file-operations.js';
+import { scanForCacheFolders, formatSize, formatFileCount } from '../libs/cache-scanner.js';
+import { deleteFolder } from '../libs/file-operations.js';
+import { getDisplayItemsWithSelection, getRecursiveSelection } from '../libs/tree-builder.js';
 import { text, confirm, multiselect, isCancel, cancel, log, spinner } from '@clack/prompts';
 import { resolve } from 'path';
 import { stat } from 'fs/promises';
@@ -59,35 +60,49 @@ export class CleanCommand extends BaseCommand {
       return;
     }
 
-    log.info(`Found ${cacheFolders.length} cache directories`);
+    // Calculate total statistics
+    const totalSize = cacheFolders.reduce((sum, folder) => sum + folder.sizeBytes, 0);
+    const totalFiles = cacheFolders.reduce((sum, folder) => sum + folder.fileCount, 0);
+    
+    log.info(`Found ${cacheFolders.length} cache directories • ${formatSize(totalSize)} • ${formatFileCount(totalFiles)}`);
 
-    cacheFolders.forEach(folder => {
-      log.message(`${folder.name} (${folder.size}) - ${folder.path}`);
-    });
+    // Build tree structure for better visualization
+    const { items, defaultValues } = getDisplayItemsWithSelection(cacheFolders, resolvedPath);
 
-    const selectedFolders = await multiselect({
-      message: 'Select directories to delete:',
-      options: cacheFolders.map(folder => ({
-        value: folder.path,
-        label: `${folder.name} (${folder.size})`,
-        hint: folder.path
-      })),
+    const selectedPaths = await multiselect({
+      message: 'Select directories to delete (📁 = folder, 📦 = cache):',
+      options: items,
+      initialValues: defaultValues,
       required: false,
     });
 
-    if (isCancel(selectedFolders)) {
+    if (isCancel(selectedPaths)) {
       cancel('Operation cancelled');
       process.exit(0);
     }
 
-    if (!selectedFolders || selectedFolders.length === 0) {
+    if (!selectedPaths || selectedPaths.length === 0) {
       log.info('No directories selected for deletion');
       console.log('Nothing to clean 🤷‍♂️');
       return;
     }
 
+    // Apply recursive selection logic
+    const selectedFolders = getRecursiveSelection(selectedPaths as string[], cacheFolders);
+    
+    if (selectedFolders.length === 0) {
+      log.info('No cache directories found in selection');
+      console.log('Nothing to clean 🤷‍♂️');
+      return;
+    }
+
+    // Calculate statistics for selected folders
+    const selectedCacheFolders = cacheFolders.filter(f => selectedFolders.includes(f.path));
+    const selectedSize = selectedCacheFolders.reduce((sum, folder) => sum + folder.sizeBytes, 0);
+    const selectedFilesCount = selectedCacheFolders.reduce((sum, folder) => sum + folder.fileCount, 0);
+
     const shouldDelete = await confirm({
-      message: `Are you sure you want to delete ${selectedFolders.length} directories? This action cannot be undone.`,
+      message: `Delete ${selectedFolders.length} directories (${formatSize(selectedSize)} • ${formatFileCount(selectedFilesCount)})? This cannot be undone.`,
     });
 
     if (isCancel(shouldDelete)) {
@@ -107,6 +122,7 @@ export class CleanCommand extends BaseCommand {
     let deletedCount = 0;
     let failedCount = 0;
     let totalSizeFreed = 0;
+    let totalFilesDeleted = 0;
 
     for (const folderPath of selectedFolders as string[]) {
       const folder = cacheFolders.find(f => f.path === folderPath);
@@ -114,7 +130,8 @@ export class CleanCommand extends BaseCommand {
         const success = await deleteFolder(folderPath);
         if (success) {
           deletedCount++;
-          totalSizeFreed += parseSizeToBytes(folder.size);
+          totalSizeFreed += folder.sizeBytes;
+          totalFilesDeleted += folder.fileCount;
         } else {
           failedCount++;
           log.error(`Failed to delete: ${folder.name}`);
@@ -126,13 +143,13 @@ export class CleanCommand extends BaseCommand {
 
     if (deletedCount > 0) {
       log.success(`Successfully deleted ${deletedCount} directories`);
-      log.info(`Space reclaimed: ${formatSize(totalSizeFreed)}`);
+      log.info(`Space reclaimed: ${formatSize(totalSizeFreed)} • ${formatFileCount(totalFilesDeleted)} removed`);
     }
     
     if (failedCount > 0) {
       log.warn(`Failed to delete ${failedCount} directories`);
     }
 
-    console.log(`\n🎉 Reclaimed ${formatSize(totalSizeFreed)} of disk space!`);
+    console.log(`\n🎉 Reclaimed ${formatSize(totalSizeFreed)} disk space • ${formatFileCount(totalFilesDeleted)} removed!`);
   }
 }
